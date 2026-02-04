@@ -230,7 +230,7 @@ def execute_workflow(prompt: str):
         # Initialize state
         state = {
              # this repo
-            "repo_path": "C:\\Users\\ABHAY\\not-cursor-main",
+            "repo_path": "C:\\Users\\ABHAY\\Desktop\\not-cursor-main",
             "files": {},
             "commits": [],
             "file_list": [],
