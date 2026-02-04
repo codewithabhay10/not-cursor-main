@@ -26,7 +26,9 @@ CORS(app)
 
 llm = ChatOllama(
     model="llama3",
-    temperature=0.7
+    temperature=0.7,
+    timeout=300,  # 5 minute timeout for longer responses
+    num_ctx=4096,  # Context window size
 )
 
 class State(TypedDict):
@@ -107,7 +109,11 @@ def action_lister(state:State, prompt:str):
         HumanMessage(content=prompt),
     ]
 
-    response = llm.invoke(messages)
+    try:
+        response = llm.invoke(messages)
+    except Exception as e:
+        print(f"❌ LLM connection error: {e}")
+        raise ConnectionError(f"Failed to connect to Ollama: {e}")
 
     return {
         **state,
@@ -166,7 +172,15 @@ Action: {entry["action"]}
         HumanMessage(content="Return the full file content. If no changes are needed, just say 'NO_CHANGE'.")
     ]
 
-    response = llm.invoke(messages)
+    try:
+        response = llm.invoke(messages)
+    except Exception as e:
+        print(f"❌ LLM connection error while processing {path}: {e}")
+        return {
+            **state,
+            "current_idx": idx + 1,
+            "next": "rewrite_files"
+        }
 
     if response.content.strip().upper() == "NO_CHANGE":
         print(f"⏭️ Skipped: {path}")
@@ -219,11 +233,10 @@ def stream_print(*args, **kwargs):
 
 def execute_workflow(prompt: str):
     """Execute the workflow in a separate thread"""
+    import builtins
+    original_print = builtins.print
+    
     try:
-        # Store original print function
-        import builtins
-        original_print = builtins.print
-        
         # Replace print function
         builtins.print = stream_print
         
@@ -247,7 +260,15 @@ def execute_workflow(prompt: str):
         print("Commits:", state["commits"])
         
         # Generate action plan
-        state = action_lister(state, prompt)
+        print("🔄 Generating plan with LLM (this may take a moment)...")
+        try:
+            state = action_lister(state, prompt)
+        except ConnectionError as e:
+            print(f"❌ Failed to connect to Ollama. Make sure Ollama is running.")
+            print(f"   Error: {e}")
+            output_queue.put("DONE")
+            builtins.print = original_print
+            return
         
         # Extract and parse plan
         try:
@@ -256,6 +277,7 @@ def execute_workflow(prompt: str):
         except Exception as e:
             print("❌ Failed to extract JSON plan:", e)
             output_queue.put("DONE")
+            builtins.print = original_print
             return
         
         state["plan"] = json.dumps(plan)
@@ -263,6 +285,7 @@ def execute_workflow(prompt: str):
         
         # Execute file modifications
         while state["next"] == "rewrite_files":
+            print(f"🔄 Processing file {state['current_idx'] + 1} of {len(plan)}...")
             state = rewrite_files(state)
         
         # Commit changes
@@ -279,14 +302,11 @@ def execute_workflow(prompt: str):
         output_queue.put("DONE")
         
     except Exception as e:
-        # Use original print for error logging to avoid recursion
-        import builtins
-        builtins.print = original_print
-        print(f"❌ Error: {e}")
+        # Use stream_print so it goes to the UI
+        stream_print(f"❌ Error: {e}")
         output_queue.put("DONE")
     finally:
         # Restore original print function
-        import builtins
         builtins.print = original_print
 
 @app.route('/')
@@ -315,18 +335,30 @@ def execute():
 @app.route('/stream')
 def stream():
     def generate():
-        while True:
+        timeout_counter = 0
+        max_timeout = 600  # 10 minutes max wait time
+        while timeout_counter < max_timeout:
             try:
                 message = output_queue.get(timeout=1)
+                timeout_counter = 0  # Reset counter when we get a message
                 if message == "DONE":
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     break
                 else:
                     yield f"data: {json.dumps({'type': 'output', 'message': message})}\n\n"
             except queue.Empty:
+                timeout_counter += 1
                 yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+        
+        if timeout_counter >= max_timeout:
+            yield f"data: {json.dumps({'type': 'output', 'message': '❌ Timeout: No response from LLM for 10 minutes'})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
     
-    return Response(generate(), mimetype='text/event-stream')
+    response = Response(generate(), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Connection'] = 'keep-alive'
+    return response
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000) 
+    app.run(debug=True, port=5000, threaded=True) 
