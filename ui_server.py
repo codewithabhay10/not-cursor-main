@@ -204,7 +204,7 @@ def commit_to_git(state: State):
             f.write(state["files"][path])
 
     subprocess.run(["git", "add"] + modified_files, cwd=repo_path, check=True)
-    subprocess.run(["git", "commit", "-m", "featurea added by Abhay's Cursor"], cwd=repo_path, check=True)
+    subprocess.run(["git", "commit", "-m", "feature added by Abhay's Cursor"], cwd=repo_path, check=True)
     subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=repo_path, check=True)
 
     print(f"✅ Changes committed and pushed to branch: {branch_name}")
