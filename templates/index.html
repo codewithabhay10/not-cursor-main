@@ -250,12 +250,12 @@
             promptInput.disabled = isLoading;
         }
 
-        function startStreaming() {
+        function startStreaming(jobId) {
             if (eventSource) {
                 eventSource.close();
             }
 
-            eventSource = new EventSource('/stream');
+            eventSource = new EventSource(`/stream/${jobId}`);
             
             eventSource.onmessage = function(event) {
                 const data = JSON.parse(event.data);
@@ -310,8 +310,8 @@
                     addOutputLine(`Error: ${data.error}`, 'error');
                     setLoading(false);
                 } else {
-                    // Start streaming output
-                    startStreaming();
+                    // Start streaming output for this specific job
+                    startStreaming(data.job_id);
                 }
 
             } catch (error) {

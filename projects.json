@@ -1,0 +1,16 @@
+[
+  {
+    "title": "Not Cursor",
+    "description": "A locally hosted AI-powered code assistant that uses LangGraph and Ollama to automatically modify and commit code changes based on natural language prompts.",
+    "color": "from-gray-800 to-gray-900",
+    "tech": [
+      "Python",
+      "Flask",
+      "LangGraph",
+      "Ollama"
+    ],
+    "image": "https://images.unsplash.com/photo-1542831371-29b0f74f9713?q=80&w=2070&auto=format&fit=crop",
+    "source": "https://github.com/codewithabhay10/not-cursor-main",
+    "demo": "https://github.com/codewithabhay10/not-cursor-main"
+  }
+]
