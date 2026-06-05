@@ -17,13 +17,17 @@ infrastructure (Ollama), so there are no API keys and no per-request cost.
 The workflow is a compiled `langgraph.StateGraph`. Each node receives a shared
 `State` (a `TypedDict`) and returns a partial update that LangGraph merges back
 in. The `rewrite` node loops over itself through a **conditional edge** until
-every planned file has been processed:
+every planned file has been processed, then the run **pauses at `review`** for
+human approval before anything is committed:
 
 ```
 START → load_context → plan → rewrite ──(more files?)──┐
                                  ▲                       │
                                  └───────────────────────┘
-                                          │ (done)
+                                          │ (done, has changes)
+                                          ▼
+                                   review  ⏸  ← interrupt(): waits for human
+                                          │
                                           ▼
                                        commit → END
 ```
@@ -32,8 +36,9 @@ START → load_context → plan → rewrite ──(more files?)──┐
 |----------------|----------------|
 | `load_context` | Read every tracked text file + the last *N* commit messages via GitPython |
 | `plan`         | Ask the LLM for a JSON list of `{file, action}` edits and parse it |
-| `rewrite`      | For each planned file, generate new content (path-traversal–guarded) |
-| `commit`       | Create a branch, write files, commit (and optionally push) |
+| `rewrite`      | For each planned file, draft new content (path-traversal–guarded) into `state["proposed"]`, leaving the baseline intact for diffing |
+| `review`       | Compute unified diffs and call LangGraph's `interrupt()` — execution pauses until a human approves |
+| `commit`       | Write **only the approved** files, create a branch, commit (and optionally push) |
 
 ### Tech stack
 
@@ -48,9 +53,9 @@ START → load_context → plan → rewrite ──(more files?)──┐
 ```
 config.py          # All tunables, loaded from .env (no hardcoded values)
 agent.py           # State, CodingAgent, the LangGraph graph + nodes
-ui_server.py       # Flask app: /execute spawns a job, /stream/<id> streams it
+ui_server.py       # Flask app: /execute, /stream/<id>, /decision/<id>
 templates/
-  index.html       # Terminal-style UI with live SSE output
+  index.html       # Terminal-style UI: live SSE output + diff review panel
 .env.example       # Copy to .env to configure
 ```
 
@@ -62,6 +67,24 @@ interfere. The agent is given an `emit` callback that pushes progress messages
 onto that queue, and the browser consumes them from `/stream/<job_id>` over
 SSE. (An earlier version monkeypatched `builtins.print` and shared one global
 queue — that was replaced because it broke under concurrent requests.)
+
+## Human-in-the-loop review
+
+The agent never commits blindly. After drafting all edits it hits the `review`
+node, which calls LangGraph's [`interrupt()`](https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/).
+That **pauses the graph mid-run** (state is persisted by a `MemorySaver`
+checkpointer) and pushes the proposed unified diffs to the browser, which
+renders them with per-file checkboxes:
+
+```
+POST /execute            → {job_id}                 (start the run)
+GET  /stream/<job_id>     → progress + a `review` SSE event with the diffs
+POST /decision/<job_id>   → {"approved": ["a.py"]}   (resume with the choice)
+```
+
+The decision is handed back into the graph via `Command(resume=decision)`; only
+the approved files are written and committed. This mirrors how real assistive
+coding tools (Cursor, Copilot) gate changes behind human review.
 
 ## Setup
 
@@ -110,10 +133,9 @@ agent plan, edit, and commit.
 
 ## Known limitations / roadmap
 
-This is a learning project; the current focus was correctness and a faithful
-LangGraph implementation. Natural next steps:
+This is a learning project; the current focus was correctness, a faithful
+LangGraph implementation, and human-in-the-loop review. Natural next steps:
 
-- **Human-in-the-loop approval** — show a diff and require approval before commit
 - **Structured output** via Pydantic / tool-calling instead of regex JSON parsing
 - **Test-and-retry loop** — run the repo's tests after editing and feed failures
   back to the model (ReAct-style self-correction)

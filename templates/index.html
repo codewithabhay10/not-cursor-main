@@ -189,6 +189,69 @@
             0%, 50% { opacity: 1; }
             51%, 100% { opacity: 0; }
         }
+
+        /* --- Diff review panel --- */
+        .review-panel {
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            border-radius: 10px;
+            padding: 16px;
+            margin: 12px 0;
+            background: rgba(255, 255, 255, 0.04);
+        }
+        .review-title { font-weight: bold; margin-bottom: 12px; color: #74c0fc; }
+        .diff-file {
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 8px;
+            margin-bottom: 12px;
+            overflow: hidden;
+        }
+        .diff-file-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            background: rgba(255, 255, 255, 0.06);
+        }
+        .diff-file-header input { width: 16px; height: 16px; cursor: pointer; }
+        .diff-file-name { font-weight: bold; }
+        .diff-status {
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(116, 192, 252, 0.2);
+            color: #74c0fc;
+            text-transform: uppercase;
+        }
+        .diff-badge { font-size: 12px; margin-left: auto; }
+        .diff-badge .add { color: #51cf66; }
+        .diff-badge .del { color: #ff6b6b; }
+        .diff-body {
+            margin: 0;
+            padding: 10px 12px;
+            overflow-x: auto;
+            font-size: 13px;
+            line-height: 1.4;
+            white-space: pre;
+            max-height: 300px;
+        }
+        .diff-line-add { color: #51cf66; }
+        .diff-line-del { color: #ff6b6b; }
+        .diff-line-meta { color: #74c0fc; }
+        .review-actions { display: flex; gap: 12px; margin-top: 8px; }
+        .review-btn {
+            font-family: inherit;
+            font-size: 14px;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            border: 1px solid #fff;
+            background: #000;
+            color: #fff;
+            transition: all 0.2s ease;
+        }
+        .review-btn.primary { background: #fff; color: #000; }
+        .review-btn:hover { box-shadow: 0 0 15px rgba(255, 255, 255, 0.4); }
+        .review-btn:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; }
     </style>
 </head>
 <body>
@@ -217,6 +280,7 @@
         const loading = document.getElementById('loading');
         const outputContainer = document.getElementById('outputContainer');
         let eventSource = null;
+        let currentJobId = null;
 
         function addOutputLine(text, type = 'normal') {
             const line = document.createElement('div');
@@ -250,25 +314,116 @@
             promptInput.disabled = isLoading;
         }
 
+        function escapeHtml(s) {
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function colorizeDiff(diffText) {
+            if (!diffText || !diffText.trim()) return '<span>(no textual diff)</span>';
+            return diffText.split('\n').map(line => {
+                const safe = escapeHtml(line);
+                if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@'))
+                    return `<span class="diff-line-meta">${safe}</span>`;
+                if (line.startsWith('+')) return `<span class="diff-line-add">${safe}</span>`;
+                if (line.startsWith('-')) return `<span class="diff-line-del">${safe}</span>`;
+                return `<span>${safe}</span>`;
+            }).join('\n');
+        }
+
+        async function submitDecision(approved) {
+            try {
+                await fetch(`/decision/${currentJobId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ approved })
+                });
+            } catch (e) {
+                addOutputLine(`Failed to send decision: ${e.message}`, 'error');
+            }
+        }
+
+        function renderReview(diffs) {
+            const panel = document.createElement('div');
+            panel.className = 'review-panel';
+
+            const title = document.createElement('div');
+            title.className = 'review-title';
+            title.textContent = `🔍 Review ${diffs.length} proposed change(s) — pick what gets committed`;
+            panel.appendChild(title);
+
+            diffs.forEach((d, i) => {
+                const file = document.createElement('div');
+                file.className = 'diff-file';
+                file.innerHTML = `
+                    <div class="diff-file-header">
+                        <input type="checkbox" data-file="${escapeHtml(d.file)}" checked />
+                        <span class="diff-status">${escapeHtml(d.status)}</span>
+                        <span class="diff-file-name">${escapeHtml(d.file)}</span>
+                        <span class="diff-badge"><span class="add">+${d.additions}</span> <span class="del">-${d.deletions}</span></span>
+                    </div>
+                    <pre class="diff-body">${colorizeDiff(d.diff)}</pre>
+                `;
+                panel.appendChild(file);
+            });
+
+            const actions = document.createElement('div');
+            actions.className = 'review-actions';
+            const approveBtn = document.createElement('button');
+            approveBtn.className = 'review-btn primary';
+            approveBtn.textContent = 'Approve selected & commit';
+            const rejectBtn = document.createElement('button');
+            rejectBtn.className = 'review-btn';
+            rejectBtn.textContent = 'Reject all';
+
+            const finish = () => {
+                approveBtn.disabled = true;
+                rejectBtn.disabled = true;
+                panel.querySelectorAll('input[type=checkbox]').forEach(cb => cb.disabled = true);
+            };
+
+            approveBtn.addEventListener('click', () => {
+                const approved = Array.from(panel.querySelectorAll('input[type=checkbox]:checked'))
+                    .map(cb => cb.getAttribute('data-file'));
+                finish();
+                addOutputLine(`Approved ${approved.length} file(s).`, 'info');
+                submitDecision(approved);
+            });
+            rejectBtn.addEventListener('click', () => {
+                finish();
+                addOutputLine('Rejected all changes.', 'warning');
+                submitDecision([]);
+            });
+
+            actions.appendChild(approveBtn);
+            actions.appendChild(rejectBtn);
+            panel.appendChild(actions);
+
+            outputContainer.appendChild(panel);
+            outputContainer.scrollTop = outputContainer.scrollHeight;
+        }
+
         function startStreaming(jobId) {
+            currentJobId = jobId;
             if (eventSource) {
                 eventSource.close();
             }
 
             eventSource = new EventSource(`/stream/${jobId}`);
-            
+
             eventSource.onmessage = function(event) {
                 const data = JSON.parse(event.data);
-                
+
                 if (data.type === 'output') {
                     let type = 'normal';
                     if (data.message.includes('❌')) type = 'error';
                     else if (data.message.includes('✅')) type = 'success';
-                    else if (data.message.includes('📋') || data.message.includes('⏭️')) type = 'warning';
-                    else if (data.message.includes('Files loaded:') || data.message.includes('Commits:')) type = 'info';
-                    else if (data.message.includes('🎉')) type = 'success';
-                    
+                    else if (data.message.includes('📋') || data.message.includes('⏭️') || data.message.includes('✍️')) type = 'warning';
+                    else if (data.message.includes('📁') || data.message.includes('🧠') || data.message.includes('🔍')) type = 'info';
+                    else if (data.message.includes('🎉') || data.message.includes('🚀') || data.message.includes('💾')) type = 'success';
+
                     addOutputLine(data.message, type);
+                } else if (data.type === 'review') {
+                    renderReview(data.diffs || []);
                 } else if (data.type === 'done') {
                     eventSource.close();
                     setLoading(false);
