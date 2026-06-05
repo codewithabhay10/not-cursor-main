@@ -27,7 +27,7 @@ import uuid
 from typing import Callable, Optional
 
 from git import Repo
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -64,11 +64,36 @@ def build_llm() -> ChatOllama:
 
 
 def _extract_json_array(text: str) -> list[dict]:
-    """Pull the first ``[ {...} ]`` JSON array out of a model response."""
-    match = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON array found in model response")
-    return json.loads(match.group(0))
+    """Pull a JSON array of plan items out of a (possibly messy) model response."""
+    cleaned = _strip_code_fences(text)
+    match = re.search(r"\[\s*\{.*\}\s*\]", cleaned, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    # Fallback: the model returned a bare object instead of an array.
+    obj = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if obj:
+        parsed = json.loads(obj.group(0))
+        return parsed if isinstance(parsed, list) else [parsed]
+    raise ValueError("No JSON array found in model response")
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove a wrapping ```lang ... ``` markdown fence if the model added one.
+
+    LLMs love to wrap file contents in markdown code blocks. Left in, those
+    backticks would be written straight into the source file and break it.
+    """
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else ""   # drop the opening fence line
+    if t.rstrip().endswith("```"):
+        t = t.rstrip()[:-3]                              # drop the closing fence
+    return t.strip("\n")
+
+
+def _is_no_change(text: str) -> bool:
+    """True if the model effectively said 'no change' (any spelling)."""
+    return text.strip().upper().replace("_", "").replace(" ", "") == "NOCHANGE"
 
 
 def _unified_diff(path: str, before: str, after: str) -> dict:
@@ -215,14 +240,33 @@ Return ONLY a JSON list of objects with "file" and "action" keys, e.g.:
 ]
 """
         self.emit("🧠 Generating plan with the model (this may take a moment)...")
-        response = self.llm.invoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=state["prompt"])]
-        )
-        plan = _extract_json_array(response.content)
+        plan = self._plan_with_retries(system_prompt, state["prompt"])
         self.emit(f"📋 Plan: {len(plan)} file action(s)")
         for item in plan:
             self.emit(f"   • {item.get('file')} — {item.get('action')}")
         return {"plan": plan, "current_idx": 0}
+
+    def _plan_with_retries(self, system_prompt: str, user_prompt: str, attempts: int = 3) -> list[dict]:
+        """Ask for the plan, re-prompting if the model returns unparseable JSON.
+
+        Smaller local models don't reliably emit clean JSON, so we give them a
+        couple of corrective tries before giving up.
+        """
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        last_error: Exception | None = None
+        for i in range(attempts):
+            response = self.llm.invoke(messages)
+            try:
+                return _extract_json_array(response.content)
+            except (ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+                self.emit(f"⚠️ Plan wasn't valid JSON (try {i + 1}/{attempts}) — retrying...")
+                messages.append(AIMessage(content=response.content))
+                messages.append(HumanMessage(
+                    content='That was not valid. Respond with ONLY a JSON array of '
+                            '{"file": ..., "action": ...} objects, nothing else.'
+                ))
+        raise ValueError(f"Could not get a valid plan after {attempts} attempts: {last_error}")
 
     def rewrite(self, state: State) -> State:
         idx = state["current_idx"]
@@ -266,8 +310,8 @@ Return ONLY a JSON list of objects with "file" and "action" keys, e.g.:
                 ),
             ]
         )
-        content = response.content.strip()
-        if content.upper() == "NO_CHANGE":
+        content = _strip_code_fences(response.content)
+        if _is_no_change(content):
             self.emit(f"⏭️ No change: {path}")
             return updates
 
