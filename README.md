@@ -1,24 +1,68 @@
 # Not Cursor — an autonomous coding agent
 
-Not Cursor turns a natural-language request ("add a dark-mode toggle") into a
-set of multi-file Git changes. It loads your repository as context, asks a
-locally-running LLM to produce a structured plan, rewrites each file, and
-commits the result to a fresh feature branch — streaming every step to the
-browser in real time.
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-state%20machine-1C3C3C)
+![Flask](https://img.shields.io/badge/Flask-SSE%20streaming-000000?logo=flask&logoColor=white)
+![Ollama](https://img.shields.io/badge/LLM-Ollama%20(local)-000000)
+![No API keys](https://img.shields.io/badge/cost-%240%20%2F%20no%20API%20keys-2ea44f)
 
-It is built as a **LangGraph state machine** running entirely on local
-infrastructure (Ollama), so there are no API keys and no per-request cost.
+> Turn a plain-English request — *"add input validation to the login form"* — into
+> reviewed, multi-file Git commits. A local LLM **plans** the change, **rewrites**
+> each file, and **commits** it to a fresh branch — pausing for **human approval**
+> before anything touches your code, and streaming every step to the browser live.
 
-> ⚠️ This is an experimental project. By design it only **commits locally** —
-> pushing to a remote is opt-in (`AUTO_PUSH=true`).
+A from-scratch take on an assistive coding agent (think Cursor / Copilot), built as a
+**LangGraph state machine** that runs entirely on local infrastructure (Ollama) — **no
+API keys, no per-token cost**. The interesting part isn't the prompts; it's the
+engineering around them: a real graph with a conditional loop, a human-in-the-loop
+`interrupt()`/resume, concurrency-safe streaming, and hard safety guards on everything
+the model is allowed to touch.
 
-## Architecture
+---
 
-The workflow is a compiled `langgraph.StateGraph`. Each node receives a shared
-`State` (a `TypedDict`) and returns a partial update that LangGraph merges back
-in. The `rewrite` node loops over itself through a **conditional edge** until
-every planned file has been processed, then the run **pauses at `review`** for
-human approval before anything is committed:
+## Engineering highlights
+
+- **A real state machine, not a prompt-in-a-while-loop.** The workflow is a compiled
+  `langgraph.StateGraph` with a typed shared state and a **conditional self-loop** that
+  rewrites each planned file before converging on review/commit.
+- **Human-in-the-loop by design.** The graph **pauses mid-run** at a `review` node via
+  LangGraph's `interrupt()` (state persisted by a `MemorySaver` checkpointer), surfaces
+  per-file diffs, and commits **only what a human approves** — then resumes with
+  `Command(resume=...)`.
+- **Concurrency-safe streaming.** Each job owns an isolated queue and streams progress
+  over **Server-Sent Events**. This replaced an earlier design that monkeypatched
+  `builtins.print` into one global queue — which broke under concurrent requests.
+- **Security-conscious file I/O.** Every model-chosen path is validated against
+  **path traversal** (`../../etc/passwd`) and restricted to a source-file allow-list
+  before a single byte is written. Commits are **local-only** by default.
+- **Resilient to messy model output.** Small local models don't reliably emit clean
+  JSON, so the planner **retries with corrective re-prompts** and strips stray markdown
+  code fences before parsing.
+- **Config-driven, zero hardcoding.** Model, target repo, context size, and push
+  behaviour all come from `.env`, so the same code runs unchanged across machines.
+
+> ⚠️ Experimental project. By design it only **commits locally** — pushing to a remote
+> is strictly opt-in (`AUTO_PUSH=true`).
+
+## Demo
+
+The UI is a terminal-style page that streams the agent's plan and per-file edits in real
+time, then drops into a **diff-review panel** with color-coded `+/-` lines and per-file
+**Approve / Reject** controls before anything is committed.
+
+<!-- Highest-impact addition for a reviewer: record a ~15s screen capture of one run
+     (type a prompt → watch plan/rewrite stream → review diffs → approve → commit),
+     save it as docs/demo.gif, and uncomment the line below.
+![Not Cursor demo](docs/demo.gif)
+-->
+
+## How it works
+
+The workflow is a compiled `langgraph.StateGraph`. Each node receives a shared `State`
+(a `TypedDict`) and returns a partial update that LangGraph merges back in. The `rewrite`
+node loops over itself through a **conditional edge** until every planned file is
+processed, then the run **pauses at `review`** for human approval before anything is
+committed:
 
 ```
 START → load_context → plan → rewrite ──(more files?)──┐
@@ -35,20 +79,44 @@ START → load_context → plan → rewrite ──(more files?)──┐
 | Node           | Responsibility |
 |----------------|----------------|
 | `load_context` | Read every tracked text file + the last *N* commit messages via GitPython |
-| `plan`         | Ask the LLM for a JSON list of `{file, action}` edits and parse it |
+| `plan`         | Ask the LLM for a JSON list of `{file, action}` edits and parse it (with retries) |
 | `rewrite`      | For each planned file, draft new content (path-traversal–guarded) into `state["proposed"]`, leaving the baseline intact for diffing |
 | `review`       | Compute unified diffs and call LangGraph's `interrupt()` — execution pauses until a human approves |
 | `commit`       | Write **only the approved** files, create a branch, commit (and optionally push) |
 
-### Tech stack
+### Concurrency-safe streaming
 
-- **Orchestration:** LangGraph (`StateGraph`, conditional edges)
+`/execute` creates a `job_id`, spins up a background thread, and returns immediately.
+Each job owns its **own queue**, so concurrent requests never interfere. The agent gets
+an `emit` callback that pushes progress messages onto that queue, and the browser
+consumes them from `/stream/<job_id>` over SSE.
+
+### Human-in-the-loop review
+
+After drafting all edits, the agent hits the `review` node and calls LangGraph's
+[`interrupt()`](https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/).
+That pauses the graph mid-run (state persisted by a `MemorySaver` checkpointer) and
+pushes the proposed diffs to the browser, which renders them with per-file checkboxes:
+
+```
+POST /execute             → {job_id}                  (start the run)
+GET  /stream/<job_id>     → progress + a `review` SSE event with the diffs
+POST /decision/<job_id>   → {"approved": ["a.py"]}    (resume with the choice)
+```
+
+The decision flows back into the graph via `Command(resume=decision)`; only approved
+files are written and committed — mirroring how Cursor and Copilot gate changes behind
+human review.
+
+## Tech stack
+
+- **Orchestration:** LangGraph (`StateGraph`, conditional edges, `interrupt()`/checkpointer)
 - **LLM:** Ollama (`llama3` by default) via `langchain-ollama` — runs locally
 - **Backend:** Flask, with per-job Server-Sent Events (SSE) for streaming
 - **VCS:** GitPython + `git` CLI
 - **Frontend:** a single dependency-free HTML/JS page
 
-### Project layout
+## Project layout
 
 ```
 config.py          # All tunables, loaded from .env (no hardcoded values)
@@ -59,88 +127,51 @@ templates/
 .env.example       # Copy to .env to configure
 ```
 
-## How streaming works
+## Run it locally
 
-`/execute` creates a `job_id`, spins up a background thread, and returns
-immediately. Each job owns its **own queue**, so concurrent requests never
-interfere. The agent is given an `emit` callback that pushes progress messages
-onto that queue, and the browser consumes them from `/stream/<job_id>` over
-SSE. (An earlier version monkeypatched `builtins.print` and shared one global
-queue — that was replaced because it broke under concurrent requests.)
+**Prerequisites:** Python 3.10+, a Git repo to operate on, and
+[Ollama](https://ollama.com) running with a model pulled:
 
-## Human-in-the-loop review
-
-The agent never commits blindly. After drafting all edits it hits the `review`
-node, which calls LangGraph's [`interrupt()`](https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/).
-That **pauses the graph mid-run** (state is persisted by a `MemorySaver`
-checkpointer) and pushes the proposed unified diffs to the browser, which
-renders them with per-file checkboxes:
-
-```
-POST /execute            → {job_id}                 (start the run)
-GET  /stream/<job_id>     → progress + a `review` SSE event with the diffs
-POST /decision/<job_id>   → {"approved": ["a.py"]}   (resume with the choice)
+```bash
+ollama pull llama3
 ```
 
-The decision is handed back into the graph via `Command(resume=decision)`; only
-the approved files are written and committed. This mirrors how real assistive
-coding tools (Cursor, Copilot) gate changes behind human review.
-
-## Setup
-
-### Prerequisites
-
-- Python 3.10+
-- [Ollama](https://ollama.com) installed and running, with a model pulled:
-  ```bash
-  ollama pull llama3
-  ```
-- A Git repository for the agent to operate on
-
-### Install
+**Install and run:**
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env        # then edit as needed
+python ui_server.py         # open http://localhost:5000
 ```
 
-Key settings in `.env`:
+Type a prompt (e.g. *"add input validation to the login form"*) and watch the agent
+plan, edit, and commit. Key `.env` settings:
 
-| Variable           | Default        | Purpose |
-|--------------------|----------------|---------|
-| `OLLAMA_MODEL`     | `llama3`       | Which local model to use |
-| `TARGET_REPO_PATH` | cwd            | Absolute path to the repo to edit |
-| `AUTO_PUSH`        | `false`        | Push the branch to `origin` after committing |
-| `GITHUB_REPO`      | —              | `owner/name`, used only to build UI links |
+| Variable           | Default | Purpose |
+|--------------------|---------|---------|
+| `OLLAMA_MODEL`     | `llama3`| Which local model to use |
+| `TARGET_REPO_PATH` | cwd     | Absolute path to the repo to edit |
+| `AUTO_PUSH`        | `false` | Push the branch to `origin` after committing |
+| `GITHUB_REPO`      | —       | `owner/name`, used only to build UI links |
 
-### Run
+## Safety
 
-```bash
-python ui_server.py
-# open http://localhost:5000
-```
+- **Path traversal is blocked** — every model-supplied path is validated to stay inside
+  the target repo before anything is written (`config.is_safe_path`).
+- **Only source files** (`.py .js .ts .jsx .tsx`) are ever edited.
+- **No automatic push** unless `AUTO_PUSH=true`. Changes land on a throwaway
+  `ai-feature-*` branch, so they're always easy to discard.
 
-Type a prompt (e.g. *"add input validation to the login form"*) and watch the
-agent plan, edit, and commit.
+## What I'd build next
 
-## Safety notes
-
-- **Path traversal is blocked** — file paths the model returns are validated to
-  stay inside the target repo before anything is written (`config.is_safe_path`).
-- **Only source files** (`.py .js .ts .jsx .tsx`) are edited.
-- **No automatic push** unless you set `AUTO_PUSH=true`. Everything lands on a
-  throwaway `ai-feature-*` branch, so the change is always easy to discard.
-
-## Known limitations / roadmap
-
-This is a learning project; the current focus was correctness, a faithful
-LangGraph implementation, and human-in-the-loop review. Natural next steps:
+The current focus was correctness, a faithful LangGraph implementation, and the
+human-in-the-loop review gate. Natural next steps:
 
 - **Structured output** via Pydantic / tool-calling instead of regex JSON parsing
-- **Test-and-retry loop** — run the repo's tests after editing and feed failures
-  back to the model (ReAct-style self-correction)
+- **Test-and-retry loop** — run the repo's tests after editing and feed failures back to
+  the model (ReAct-style self-correction)
 - **RAG over the repo** instead of stuffing every file into the prompt
-- Unit tests + Docker Compose (app + Ollama)
+- **Unit tests + Docker Compose** (app + Ollama) for one-command setup
 
 ---
 
