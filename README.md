@@ -50,11 +50,9 @@ The UI is a terminal-style page that streams the agent's plan and per-file edits
 time, then drops into a **diff-review panel** with color-coded `+/-` lines and per-file
 **Approve / Reject** controls before anything is committed.
 
-<!-- Highest-impact addition for a reviewer: record a ~15s screen capture of one run
-     (type a prompt → watch plan/rewrite stream → review diffs → approve → commit),
-     save it as docs/demo.gif, and uncomment the line below.
-![Not Cursor demo](docs/demo.gif)
--->
+![Not Cursor — Diff Review View](docs/demo-diff-view.png)
+
+![Not Cursor — Plan & Execution View](docs/demo-plan-view.png)
 
 ## How it works
 
